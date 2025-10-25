@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Виртуальное окружение (Самое важное!)
+venv*/
+.venv/
+venv/
+env/
+
+# IDE/Редакторы (VS Code, PyCharm и т.д.)
+.vscode/
+.idea/
+*.swp
+
+# Сборка/Упаковка
+build/
+dist/
+*.egg-info/
+.installed.cfg
+
+# Временные файлы/Кэш
+.mypy_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Локальные данные/Конфигурация (Важно для безопасности!)
+.env
+.flaskenv
+*.db
+*.pdf
+/data/
