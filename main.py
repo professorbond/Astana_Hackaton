@@ -1,30 +1,79 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
 import pandas as pd
 import pdfplumber
 import requests
-from io import BytesIO
+import os
 import re
+from io import BytesIO
 
+# === Инициализация приложения ===
 app = FastAPI()
 
-# Разрешаем запросы с фронтенда (Next.js)
+# === Загружаем .env ===
+load_dotenv()
+OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/generate")
+MODEL_NAME = os.getenv("MODEL_NAME", "mistral")
+
+# === Настройка CORS (разрешить Next.js фронтенд) ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # замени на адрес фронтенда при деплое
+    allow_origins=["*"],  # ⚠️ При деплое укажи конкретный домен фронта
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-OLLAMA_API = "http://localhost:11434/api/generate"
+
+# === Модель данных для чата ===
+class ChatRequest(BaseModel):
+    message: str
 
 
+# === CHAT ENDPOINT ===
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """
+    Принимает текстовый запрос от пользователя → отправляет в Mistral через Ollama → возвращает ответ.
+    """
+    try:
+        payload = {"model": MODEL_NAME, "prompt": request.message}
+
+        response = requests.post(OLLAMA_API, json=payload, timeout=120, stream=True)
+
+        if not response.ok:
+            raise HTTPException(
+                status_code=500, detail=f"Ollama error: {response.text}"
+            )
+
+        full_text = ""
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                text = line.decode("utf-8").strip()
+                if text.startswith("{") and '"response"' in text:
+                    match = re.search(r'"response"\s*:\s*"([^"]*)"', text)
+                    if match:
+                        full_text += match.group(1)
+            except Exception:
+                continue
+
+        return {"reply": full_text.strip() or "Модель не вернула ответ."}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+
+# === ROOT ===
 @app.get("/")
 def root():
     return {"message": "AI Bank Backend is running"}
 
 
+# === ANALYZE EXPENSES ENDPOINT ===
 @app.post("/analyze-expenses")
 async def analyze_expenses(file: UploadFile = File(...)):
     """
@@ -36,10 +85,8 @@ async def analyze_expenses(file: UploadFile = File(...)):
     filename = file.filename.lower()
 
     try:
-        # читаем содержимое файла
         content = await file.read()
 
-        # читаем по типу файла
         if filename.endswith(".xlsx"):
             df = pd.read_excel(BytesIO(content))
         elif filename.endswith(".csv"):
@@ -57,10 +104,9 @@ async def analyze_expenses(file: UploadFile = File(...)):
                 status_code=400, detail="Не удалось извлечь данные из файла"
             )
 
-        # нормализуем имена колонок
         df.columns = [col.lower().strip() for col in df.columns]
 
-        # проверяем наличие основных колонок
+        # Проверяем наличие обязательных колонок
         if "category" not in df.columns and "категория" not in df.columns:
             if "description" in df.columns:
                 df.rename(columns={"description": "category"}, inplace=True)
@@ -68,7 +114,6 @@ async def analyze_expenses(file: UploadFile = File(...)):
                 df["category"] = "Не указано"
 
         if "amount" not in df.columns and "сумма" not in df.columns:
-            # пробуем найти похожие числовые колонки
             for col in df.columns:
                 if df[col].apply(lambda x: isinstance(x, (int, float))).any():
                     df.rename(columns={col: "amount"}, inplace=True)
@@ -79,10 +124,8 @@ async def analyze_expenses(file: UploadFile = File(...)):
                 status_code=400, detail="Не удалось определить колонку 'amount' (сумма)"
             )
 
-        # берём первые 20 строк
         sample_data = df.head(20).to_dict(orient="records")
 
-        # создаём промпт для модели
         prompt = f"""
         Вот пример расходов пользователя:
         {sample_data}
@@ -93,8 +136,7 @@ async def analyze_expenses(file: UploadFile = File(...)):
         3. Какую сумму можно было бы сэкономить ежемесячно?
         """
 
-        # отправляем в Ollama (с построчным чтением JSON)
-        payload = {"model": "mistral", "prompt": prompt}
+        payload = {"model": MODEL_NAME, "prompt": prompt}
         response = requests.post(OLLAMA_API, json=payload, timeout=120, stream=True)
 
         if not response.ok:
@@ -102,14 +144,12 @@ async def analyze_expenses(file: UploadFile = File(...)):
                 status_code=500, detail=f"Ollama error: {response.text}"
             )
 
-        # Ollama возвращает несколько JSON-объектов построчно
         full_text = ""
         for line in response.iter_lines():
             if line:
                 try:
                     text = line.decode("utf-8").strip()
                     if text.startswith("{") and '"response"' in text:
-                        # безопасно извлекаем текст из строки
                         match = re.search(r'"response"\s*:\s*"([^"]*)"', text)
                         if match:
                             full_text += match.group(1)
@@ -122,8 +162,7 @@ async def analyze_expenses(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
 
 
-# === Парсер PDF ==========================================================================
-
+# === PDF ПАРСЕР ===
 date_re = re.compile(r"(\d{1,2}\.\d{1,2}\.\d{2,4})")
 amount_re = re.compile(
     r"([+-]?\s?\d{1,3}(?:[\s\d]{0,}\d)?(?:[.,]\d{2})?)\s*(?:₸|KZT|т|тг|\$|₽)?"
@@ -147,7 +186,6 @@ def parse_pdf(file_obj):
 
                 date_match = date_re.search(line)
                 amount_match = list(amount_re.finditer(line))
-
                 if not date_match or not amount_match:
                     continue
 
@@ -156,7 +194,6 @@ def parse_pdf(file_obj):
 
                 chosen_amount = None
                 chosen_amount_span = None
-
                 for m in amount_match:
                     if m.start() >= date_end - 1:
                         chosen_amount = m.group(1)
