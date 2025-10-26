@@ -1,5 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import Session, select
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import pandas as pd
@@ -7,10 +8,24 @@ import pdfplumber
 import requests
 import os
 import re
+import json
 from io import BytesIO
+from datetime import datetime, timedelta
+from typing import List
+
+# Импорты для аутентификации и базы данных
+from models import (
+    User, UploadedFile, UserCreate, UserLogin, UserResponse, 
+    Token, FileAnalysisResponse, AdminReportItem
+)
+from simple_auth import (
+    authenticate_user, create_access_token, get_current_user, 
+    get_current_admin_user, get_password_hash, ACCESS_TOKEN_EXPIRE_MINUTES
+)
+from database_sqlite import get_session, create_db_and_tables
 
 # === Инициализация приложения ===
-app = FastAPI()
+app = FastAPI(title="AI Bank Backend", version="1.0.0")
 
 # === Загружаем .env ===
 load_dotenv()
@@ -25,6 +40,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# === Создание таблиц и seed данных при запуске ===
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
+    
+    # Создаем seed данные
+    try:
+        from simple_seed import create_simple_seed_data
+        create_simple_seed_data()
+    except Exception as e:
+        print(f"Ошибка при создании seed данных: {e}")
 
 
 # === CHAT ===
@@ -61,15 +88,68 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 
-@app.get("/")
-def root():
-    return {"message": "AI Bank Backend is running ✅"}
+# === АУТЕНТИФИКАЦИЯ ===
+@app.post("/register", response_model=UserResponse)
+async def register(user_data: UserCreate, session: Session = Depends(get_session)):
+    """Регистрация нового пользователя"""
+    # Проверяем, существует ли пользователь
+    statement = select(User).where(
+        (User.username == user_data.username) | (User.email == user_data.email)
+    )
+    existing_user = session.exec(statement).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=400, 
+            detail="Пользователь с таким именем или email уже существует"
+        )
+    
+    # Создаем нового пользователя
+    hashed_password = get_password_hash(user_data.password)
+    user = User(
+        username=user_data.username,
+        email=user_data.email,
+        password_hash=hashed_password
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    
+    return user
 
 
-# === ANALYZE EXPENSES ===
+@app.post("/login", response_model=Token)
+async def login(user_data: UserLogin, session: Session = Depends(get_session)):
+    """Вход пользователя и получение токена"""
+    user = authenticate_user(session, user_data.username, user_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Неверное имя пользователя или пароль",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/me", response_model=UserResponse)
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    """Получение профиля текущего пользователя"""
+    return current_user
+
+
+# === АНАЛИЗ РАСХОДОВ (ОБНОВЛЕННЫЙ) ===
 @app.post("/analyze-expenses")
-async def analyze_expenses(file: UploadFile = File(...)):
-    """Загружает .pdf/.csv/.xlsx, анализирует расходы, возвращает советы и данные для графиков"""
+async def analyze_expenses(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    """Загружает .pdf/.csv/.xlsx, анализирует расходы, сохраняет в БД и возвращает советы"""
     filename = file.filename.lower()
     try:
         content = await file.read()
@@ -160,18 +240,116 @@ async def analyze_expenses(file: UploadFile = File(...)):
         # Все транзакции
         transactions = df.head(100).to_dict(orient="records")
 
+        # --- 4. Сохраняем в базу данных ---
+        total_amount = df["amount"].sum()
+        transactions_count = len(df)
+        
+        uploaded_file = UploadedFile(
+            user_id=current_user.id,
+            filename=file.filename,
+            category_stats=json.dumps(by_category),
+            ai_analysis=full_text.strip() or "Нет ответа от модели.",
+            total_amount=total_amount,
+            transactions_count=transactions_count
+        )
+        
+        session.add(uploaded_file)
+        session.commit()
+        session.refresh(uploaded_file)
+
         return {
+            "file_id": uploaded_file.id,
             "reply": full_text.strip() or "Нет ответа от модели.",
             "transactions": transactions,
             "by_category": by_category,
             "by_date": by_date,
+            "total_amount": total_amount,
+            "transactions_count": transactions_count
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
 
 
-# === PDF ПАРСЕР ===
+# === АДМИН-ПАНЕЛЬ ===
+@app.get("/admin/reports", response_model=List[AdminReportItem])
+async def get_admin_reports(
+    current_user: User = Depends(get_current_admin_user),
+    session: Session = Depends(get_session)
+):
+    """Получение отчетов всех пользователей (только для админов)"""
+    # Получаем всех пользователей с их файлами
+    statement = select(User)
+    users = session.exec(statement).all()
+    
+    reports = []
+    for user in users:
+        # Получаем файлы пользователя
+        files_statement = select(UploadedFile).where(UploadedFile.user_id == user.id)
+        files = session.exec(files_statement).all()
+        
+        # Подсчитываем статистику
+        files_count = len(files)
+        total_uploaded_amount = sum(file.total_amount or 0 for file in files)
+        last_upload = max((file.upload_date for file in files), default=None)
+        
+        # Преобразуем файлы в формат ответа
+        file_responses = [
+            FileAnalysisResponse(
+                id=file.id,
+                filename=file.filename,
+                upload_date=file.upload_date,
+                ai_analysis=file.ai_analysis,
+                total_amount=file.total_amount,
+                transactions_count=file.transactions_count,
+                category_stats=file.category_stats
+            )
+            for file in files
+        ]
+        
+        reports.append(AdminReportItem(
+            user_id=user.id,
+            username=user.username,
+            email=user.email,
+            files_count=files_count,
+            total_uploaded_amount=total_uploaded_amount,
+            last_upload=last_upload,
+            files=file_responses
+        ))
+    
+    return reports
+
+
+# === ПОЛУЧЕНИЕ ФАЙЛОВ ПОЛЬЗОВАТЕЛЯ ===
+@app.get("/my-files", response_model=List[FileAnalysisResponse])
+async def get_my_files(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    """Получение всех загруженных файлов текущего пользователя"""
+    statement = select(UploadedFile).where(UploadedFile.user_id == current_user.id)
+    files = session.exec(statement).all()
+    
+    return [
+        FileAnalysisResponse(
+            id=file.id,
+            filename=file.filename,
+            upload_date=file.upload_date,
+            ai_analysis=file.ai_analysis,
+            total_amount=file.total_amount,
+            transactions_count=file.transactions_count,
+            category_stats=file.category_stats
+        )
+        for file in files
+    ]
+
+
+@app.get("/")
+def root():
+    return {"message": "AI Bank Backend is running ✅"}
+
+
+# === PDF ПАРСЕР (БЕЗ ИЗМЕНЕНИЙ) ===
 date_re = re.compile(r"(\d{1,2}\.\d{1,2}\.\d{2,4})")
 amount_re = re.compile(
     r"([+-]?\s?\d{1,3}(?:[\s\d]{0,}\d)?(?:[.,]\d{2})?)\s*(?:₸|KZT|т|тг|\$|₽)?"
