@@ -225,8 +225,12 @@ async def analyze_expenses(
             df.groupby("category")["amount"]
             .sum()
             .reset_index()
-            .to_dict(orient="records")
         )
+        # Конвертируем индексы в строки и суммы в float
+        by_category = [
+            {"category": str(row["category"]), "amount": float(row["amount"])}
+            for _, row in by_category.iterrows()
+        ]
 
         # По датам
         if "date" in df.columns:
@@ -234,22 +238,35 @@ async def analyze_expenses(
                 df.groupby("date")["amount"]
                 .sum()
                 .reset_index()
-                .to_dict(orient="records")
             )
+            # Конвертируем индексы в строки и суммы в float
+            by_date = [
+                {"date": str(row["date"]), "amount": float(row["amount"])}
+                for _, row in by_date.iterrows()
+            ]
         else:
             by_date = []
 
         # Все транзакции
         transactions = df.head(100).to_dict(orient="records")
+        # Конвертируем numpy типы в обычные Python типы
+        transactions = [
+            {
+                k: (float(v) if isinstance(v, (int, float)) and hasattr(v, 'dtype') else v)
+                for k, v in trans.items()
+            }
+            for trans in transactions
+        ]
 
         # --- 4. Сохраняем в базу данных ---
-        total_amount = df["amount"].sum()
-        transactions_count = len(df)
+        # Конвертируем numpy типы в Python типы для корректной работы с БД
+        total_amount = float(df["amount"].sum())
+        transactions_count = int(len(df))
         
         uploaded_file = UploadedFile(
             user_id=current_user.id,
             filename=file.filename,
-            category_stats=json.dumps(by_category),
+            category_stats=json.dumps(by_category, ensure_ascii=False),
             ai_analysis=full_text.strip() or "Нет ответа от модели.",
             total_amount=total_amount,
             transactions_count=transactions_count
