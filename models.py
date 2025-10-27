@@ -82,3 +82,4 @@ class AdminReportItem(SQLModel):
     total_uploaded_amount: float
     last_upload: Optional[datetime]
     files: List[FileAnalysisResponse]
+

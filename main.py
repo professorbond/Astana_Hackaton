@@ -20,8 +20,10 @@ from models import (
 )
 from simple_auth import (
     authenticate_user, create_access_token, get_current_user, 
-    get_current_admin_user, get_password_hash, ACCESS_TOKEN_EXPIRE_MINUTES
+    get_current_admin_user, get_password_hash
 )
+
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 from database_sqlite import get_session, create_db_and_tables
 
 # === Инициализация приложения ===
@@ -274,7 +276,7 @@ async def analyze_expenses(
 # === АДМИН-ПАНЕЛЬ ===
 @app.get("/admin/reports", response_model=List[AdminReportItem])
 async def get_admin_reports(
-    current_user: User = Depends(get_current_admin_user),
+    current_user: User = Depends(get_current_admin_user),  # Проверяем что пользователь - админ
     session: Session = Depends(get_session)
 ):
     """Получение отчетов всех пользователей (только для админов)"""

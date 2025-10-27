@@ -20,3 +20,4 @@ def get_session():
     """Получение сессии базы данных"""
     with Session(engine) as session:
         yield session
+

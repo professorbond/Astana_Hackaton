@@ -90,3 +90,4 @@ async def get_current_admin_user(current_user: User = Depends(get_current_user))
             detail="Not enough permissions"
         )
     return current_user
+

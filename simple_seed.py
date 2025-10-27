@@ -144,3 +144,4 @@ def create_simple_seed_data():
 
 if __name__ == "__main__":
     create_simple_seed_data()
+

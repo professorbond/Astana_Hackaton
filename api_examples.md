@@ -173,3 +173,4 @@ const response = await fetch("http://localhost:8000/analyze-expenses", {
 
 const result = await response.json();
 ```
+
